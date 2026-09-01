@@ -1,0 +1,12 @@
+[package]
+name = "ratewright"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Converts rate limit specs between nginx-style shorthand and count/window notation"
+
+[[bin]]
+name = "ratewright"
+path = "src/main.rs"
+
+[dependencies]
