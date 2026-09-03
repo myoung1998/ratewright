@@ -84,6 +84,12 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 /// Parses nginx-style shorthand, e.g. `"10r/s"` or `"600r/m"`.
+///
+/// The unit may carry a leading magnitude, e.g. `"7r/2m"` for 7
+/// requests per 2 minutes. This isn't valid nginx config syntax (nginx
+/// only accepts a bare `s` or `m`), but it's what [`format_shorthand`]
+/// falls back to when a window can't be expressed as a whole count of
+/// a single unit, so parsing has to accept it back.
 pub fn parse_shorthand(input: &str) -> Result<RateLimit, ParseError> {
     let input = input.trim();
     if input.is_empty() {
@@ -100,26 +106,28 @@ pub fn parse_shorthand(input: &str) -> Result<RateLimit, ParseError> {
     if limit == 0 {
         return Err(ParseError::ZeroLimit);
     }
-    let unit_char = unit_part
-        .trim()
-        .chars()
-        .next()
-        .ok_or_else(|| ParseError::InvalidUnit(unit_part.to_string()))?;
-    let unit = Unit::from_char(unit_char.to_ascii_lowercase())
-        .ok_or_else(|| ParseError::InvalidUnit(unit_part.to_string()))?;
-    Ok(RateLimit {
-        limit,
-        window_secs: unit.seconds(),
-    })
+    let (magnitude, unit) = parse_magnitude_and_unit(unit_part)?;
+    let window_secs = magnitude * unit.seconds();
+    if window_secs == 0 {
+        return Err(ParseError::ZeroWindow);
+    }
+    Ok(RateLimit { limit, window_secs })
 }
 
 /// Renders a [`RateLimit`] as nginx-style shorthand, picking the
 /// largest whole unit that divides the window evenly so the output
-/// stays readable. Falls back to seconds if nothing bigger fits.
+/// stays readable. When the window isn't a whole multiple of that unit
+/// (e.g. a 13 second window), the count is left untouched and the unit
+/// carries a magnitude instead (`"7r/13s"`), rather than rounding the
+/// count and silently changing the rate.
 pub fn format_shorthand(rate: &RateLimit) -> String {
     let unit = largest_exact_unit(rate.window_secs);
-    let scaled_limit = rate.limit / (rate.window_secs / unit.seconds());
-    format!("{}r/{}", scaled_limit, unit.to_char())
+    let magnitude = rate.window_secs / unit.seconds();
+    if magnitude == 1 {
+        format!("{}r/{}", rate.limit, unit.to_char())
+    } else {
+        format!("{}r/{}{}", rate.limit, magnitude, unit.to_char())
+    }
 }
 
 /// Parses count/window notation, e.g. `"10/1s"`, `"600/60s"`, or a
@@ -137,26 +145,37 @@ pub fn parse_window(input: &str) -> Result<RateLimit, ParseError> {
     if limit == 0 {
         return Err(ParseError::ZeroLimit);
     }
+    let (magnitude, unit) = parse_magnitude_and_unit(window_part)?;
+    let window_secs = magnitude * unit.seconds();
+    if window_secs == 0 {
+        return Err(ParseError::ZeroWindow);
+    }
+    Ok(RateLimit { limit, window_secs })
+}
 
-    let window_part = window_part.trim();
-    let (digits, unit_suffix): (&str, &str) = match window_part.find(|c: char| !c.is_ascii_digit()) {
-        Some(idx) => window_part.split_at(idx),
-        None => (window_part, ""),
+/// Splits a string like `"60s"`, `"600"`, or `"s"` into a magnitude and
+/// a unit. A missing digit run defaults the magnitude to 1 (so a bare
+/// unit letter, as in plain shorthand, means "one of these"); a
+/// missing unit suffix defaults to seconds (so a bare number, as in
+/// plain window notation, means "this many seconds").
+fn parse_magnitude_and_unit(s: &str) -> Result<(u64, Unit), ParseError> {
+    let s = s.trim();
+    let (digits, unit_suffix): (&str, &str) = match s.find(|c: char| !c.is_ascii_digit()) {
+        Some(idx) => s.split_at(idx),
+        None => (s, ""),
     };
-    let magnitude: u64 = digits
-        .parse()
-        .map_err(|_| ParseError::InvalidNumber(digits.to_string()))?;
+    let magnitude: u64 = if digits.is_empty() {
+        1
+    } else {
+        digits.parse().map_err(|_| ParseError::InvalidNumber(digits.to_string()))?
+    };
     let unit = if unit_suffix.is_empty() {
         Unit::Second
     } else {
         let unit_char = unit_suffix.chars().next().unwrap().to_ascii_lowercase();
         Unit::from_char(unit_char).ok_or_else(|| ParseError::InvalidUnit(unit_suffix.to_string()))?
     };
-    let window_secs = magnitude * unit.seconds();
-    if window_secs == 0 {
-        return Err(ParseError::ZeroWindow);
-    }
-    Ok(RateLimit { limit, window_secs })
+    Ok((magnitude, unit))
 }
 
 /// Renders a [`RateLimit`] as count/window notation in raw seconds,
@@ -239,15 +258,38 @@ mod tests {
 
     #[test]
     fn formats_pick_the_largest_exact_unit() {
-        assert_eq!(format_shorthand(&RateLimit { limit: 3600, window_secs: 3600 }), "1r/h");
+        assert_eq!(format_shorthand(&RateLimit { limit: 3600, window_secs: 3600 }), "3600r/h");
         assert_eq!(format_shorthand(&RateLimit { limit: 100, window_secs: 60 }), "100r/m");
-        assert_eq!(format_shorthand(&RateLimit { limit: 7, window_secs: 13 }), "7r/s");
+    }
+
+    #[test]
+    fn formats_fall_back_to_a_magnitude_when_no_unit_divides_evenly() {
+        // 13 seconds isn't a whole minute/hour/day, so the count stays
+        // untouched and the unit carries the leftover magnitude instead
+        // of silently rounding the count and changing the rate.
+        assert_eq!(format_shorthand(&RateLimit { limit: 7, window_secs: 13 }), "7r/13s");
+        // 120 seconds is a whole number of minutes (2), so it reduces to
+        // that unit with an explicit magnitude, leaving the count of 7
+        // untouched rather than truncating it down to 3 per minute.
+        assert_eq!(format_shorthand(&RateLimit { limit: 7, window_secs: 120 }), "7r/2m");
+    }
+
+    #[test]
+    fn parses_shorthand_with_a_magnitude_on_the_unit() {
+        assert_eq!(
+            parse_shorthand("7r/2m").unwrap(),
+            RateLimit { limit: 7, window_secs: 120 }
+        );
+        assert_eq!(parse_shorthand("10r/0s"), Err(ParseError::ZeroWindow));
     }
 
     #[test]
     fn round_trips_between_formats() {
         assert_eq!(shorthand_to_window("10r/s").unwrap(), "10/1s");
         assert_eq!(window_to_shorthand("600/60s").unwrap(), "600r/m");
+        assert_eq!(shorthand_to_window("7r/2m").unwrap(), "7/120s");
+        assert_eq!(window_to_shorthand("7/120s").unwrap(), "7r/2m");
+        assert_eq!(window_to_shorthand("10/13s").unwrap(), "10r/13s");
     }
 
     #[test]

@@ -9,7 +9,10 @@ draft `RateLimit-Limit` header describe the same thing as `10/1s` or
 
 ratewright converts between the two notations:
 
-- **shorthand** — nginx style, `<count>r/<unit>`, unit is `s`, `m`, `h`, or `d`
+- **shorthand** — nginx style, `<count>r/<unit>`, unit is `s`, `m`, `h`, or `d`.
+  The unit can also carry a magnitude (`7r/2m`) — this isn't valid nginx
+  config syntax, but it's how a window that isn't a whole multiple of a
+  single unit round-trips without rounding the count
 - **window** — `<count>/<seconds>[unit]`, e.g. `10/60s` or `10/60`
 
 Both parse into the same internal `RateLimit { limit, window_secs }`,
