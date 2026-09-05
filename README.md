@@ -18,6 +18,13 @@ ratewright converts between the two notations:
 Both parse into the same internal `RateLimit { limit, window_secs }`,
 so a value written either way converts losslessly.
 
+It also understands **token-bucket descriptors** — `<shorthand-rate>;burst=<n>`,
+e.g. `10r/s;burst=20`, matching nginx's `limit_req zone=...; burst=20;`.
+A token bucket is mathematically the same thing as GCRA (the generic
+cell rate algorithm used by redis-cell, Envoy, and similar limiters), so
+`gcra_emission_interval` and `gcra_delay_variation_tolerance` convert one
+to the other.
+
 ## Usage
 
 As a library:
@@ -41,6 +48,9 @@ $ cargo run -- to-shorthand 600/60s
 
 $ cargo run -- to-shorthand 10/13s
 10r/13s   # falls back to seconds since 13 isn't a clean minute/hour/day
+
+$ cargo run -- gcra "10r/s;burst=20"
+emission_interval=0.1s delay_variation_tolerance=2s
 ```
 
 ## Design
@@ -54,9 +64,8 @@ beyond the standard library.
 
 ## Status
 
-Early skeleton. Handles the two notations above; see the roadmap in
-the project's issues for what's planned next (token-bucket and
-GCRA-style descriptors, a `--check` mode for comparing two specs).
+Early skeleton. Handles shorthand, window, and token-bucket/GCRA
+notation; a `--check` mode for comparing two specs is next.
 
 ## License
 

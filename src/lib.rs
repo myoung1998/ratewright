@@ -66,6 +66,8 @@ pub enum ParseError {
     InvalidUnit(String),
     ZeroLimit,
     ZeroWindow,
+    MissingBurst,
+    InvalidBurst(String),
 }
 
 impl fmt::Display for ParseError {
@@ -77,6 +79,8 @@ impl fmt::Display for ParseError {
             ParseError::InvalidUnit(s) => write!(f, "'{s}' is not a valid time unit (use s, m, h, or d)"),
             ParseError::ZeroLimit => write!(f, "request limit must be greater than zero"),
             ParseError::ZeroWindow => write!(f, "window must be greater than zero"),
+            ParseError::MissingBurst => write!(f, "missing ';burst=N' segment"),
+            ParseError::InvalidBurst(s) => write!(f, "'{s}' is not a valid burst (expected 'burst=N')"),
         }
     }
 }
@@ -200,6 +204,62 @@ pub fn window_to_shorthand(input: &str) -> Result<String, ParseError> {
     parse_window(input).map(|rate| format_shorthand(&rate))
 }
 
+/// A token bucket: refills at a steady `rate` and holds up to `burst`
+/// extra requests worth of capacity on top of that. This is the model
+/// behind nginx's `limit_req zone=...; burst=N;` directive.
+///
+/// It's also just GCRA (the generic cell rate algorithm used by things
+/// like redis-cell and Envoy's rate limiter) under a different name: a
+/// GCRA limiter with emission interval `T` and delay variation tolerance
+/// `tau` accepts exactly the same traffic as a token bucket refilling at
+/// `1/T` with burst `tau/T`. See [`gcra_emission_interval`] and
+/// [`gcra_delay_variation_tolerance`] for that conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenBucket {
+    pub rate: RateLimit,
+    pub burst: u64,
+}
+
+/// Parses a token-bucket descriptor, e.g. `"10r/s;burst=20"`. The rate
+/// half accepts anything [`parse_shorthand`] does, including the
+/// magnitude-on-unit fallback (`"7r/2m;burst=5"`).
+pub fn parse_token_bucket(input: &str) -> Result<TokenBucket, ParseError> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(ParseError::Empty);
+    }
+    let (rate_part, burst_part) = input.split_once(';').ok_or(ParseError::MissingBurst)?;
+    let rate = parse_shorthand(rate_part)?;
+    let burst_part = burst_part.trim();
+    let digits = burst_part
+        .strip_prefix("burst=")
+        .ok_or_else(|| ParseError::InvalidBurst(burst_part.to_string()))?;
+    let burst: u64 = digits
+        .parse()
+        .map_err(|_| ParseError::InvalidBurst(burst_part.to_string()))?;
+    Ok(TokenBucket { rate, burst })
+}
+
+/// Renders a [`TokenBucket`] back to descriptor form, e.g.
+/// `"10r/s;burst=20"`.
+pub fn format_token_bucket(bucket: &TokenBucket) -> String {
+    format!("{};burst={}", format_shorthand(&bucket.rate), bucket.burst)
+}
+
+/// GCRA's emission interval: the steady-state time between conforming
+/// requests, in seconds. Equivalent to `1 / requests_per_second`.
+pub fn gcra_emission_interval(rate: &RateLimit) -> f64 {
+    rate.window_secs as f64 / rate.limit as f64
+}
+
+/// GCRA's delay variation tolerance: how far a burst of requests is
+/// allowed to run ahead of the steady-state schedule before being
+/// throttled, in seconds. A token bucket with `burst` extra capacity on
+/// top of `rate` tolerates exactly `burst` emission intervals of slack.
+pub fn gcra_delay_variation_tolerance(bucket: &TokenBucket) -> f64 {
+    bucket.burst as f64 * gcra_emission_interval(&bucket.rate)
+}
+
 /// Largest unit that divides `window_secs` with no remainder, falling
 /// back to seconds if nothing bigger fits.
 fn largest_exact_unit(window_secs: u64) -> Unit {
@@ -296,5 +356,42 @@ mod tests {
     fn requests_per_second_matches_expectation() {
         let rate = RateLimit { limit: 30, window_secs: 60 };
         assert!((requests_per_second(&rate) - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parses_and_formats_token_bucket() {
+        assert_eq!(
+            parse_token_bucket("10r/s;burst=20").unwrap(),
+            TokenBucket { rate: RateLimit { limit: 10, window_secs: 1 }, burst: 20 }
+        );
+        assert_eq!(format_token_bucket(&TokenBucket {
+            rate: RateLimit { limit: 10, window_secs: 1 },
+            burst: 20,
+        }), "10r/s;burst=20");
+        // Round-trips through the magnitude-on-unit fallback too.
+        assert_eq!(
+            parse_token_bucket("7r/2m;burst=3").unwrap(),
+            TokenBucket { rate: RateLimit { limit: 7, window_secs: 120 }, burst: 3 }
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_token_buckets() {
+        assert_eq!(parse_token_bucket(""), Err(ParseError::Empty));
+        assert_eq!(parse_token_bucket("10r/s"), Err(ParseError::MissingBurst));
+        assert!(matches!(parse_token_bucket("10r/s;burst=abc"), Err(ParseError::InvalidBurst(_))));
+        assert!(matches!(parse_token_bucket("10r/s;max=5"), Err(ParseError::InvalidBurst(_))));
+        assert!(matches!(parse_token_bucket("0r/s;burst=5"), Err(ParseError::ZeroLimit)));
+    }
+
+    #[test]
+    fn gcra_parameters_match_token_bucket() {
+        let bucket = TokenBucket { rate: RateLimit { limit: 10, window_secs: 1 }, burst: 20 };
+        assert!((gcra_emission_interval(&bucket.rate) - 0.1).abs() < f64::EPSILON);
+        assert!((gcra_delay_variation_tolerance(&bucket) - 2.0).abs() < f64::EPSILON);
+
+        let slow = TokenBucket { rate: RateLimit { limit: 1, window_secs: 60 }, burst: 5 };
+        assert!((gcra_emission_interval(&slow.rate) - 60.0).abs() < f64::EPSILON);
+        assert!((gcra_delay_variation_tolerance(&slow) - 300.0).abs() < f64::EPSILON);
     }
 }
