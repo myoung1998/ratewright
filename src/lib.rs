@@ -204,6 +204,32 @@ pub fn window_to_shorthand(input: &str) -> Result<String, ParseError> {
     parse_window(input).map(|rate| format_shorthand(&rate))
 }
 
+/// Parses a rate spec in whichever of the three notations ratewright
+/// understands: shorthand (`10r/s`), window (`10/60s`), or a
+/// token-bucket descriptor (`10r/s;burst=20`, burst is ignored). Used
+/// by [`equivalent`] callers that need to accept either side of a
+/// comparison in whatever spelling it shows up in.
+///
+/// This works because [`parse_shorthand`] already treats the `r`
+/// suffix as optional, so it happens to accept window notation too;
+/// the only case that needs a separate branch is the `;burst=` tail.
+pub fn parse_rate(input: &str) -> Result<RateLimit, ParseError> {
+    match input.split_once(';') {
+        Some(_) => parse_token_bucket(input).map(|bucket| bucket.rate),
+        None => parse_shorthand(input),
+    }
+}
+
+/// True if two rate limits allow the same steady-state throughput,
+/// e.g. `10r/s` and `36000/1h` are equivalent even though neither
+/// parses to the same `RateLimit` value. Compared by cross-multiplying
+/// (`a.limit * b.window_secs == b.limit * a.window_secs`) rather than
+/// via [`requests_per_second`], so the result is exact and never
+/// subject to floating point rounding.
+pub fn equivalent(a: &RateLimit, b: &RateLimit) -> bool {
+    a.limit as u128 * b.window_secs as u128 == b.limit as u128 * a.window_secs as u128
+}
+
 /// A token bucket: refills at a steady `rate` and holds up to `burst`
 /// extra requests worth of capacity on top of that. This is the model
 /// behind nginx's `limit_req zone=...; burst=N;` directive.
@@ -382,6 +408,38 @@ mod tests {
         assert!(matches!(parse_token_bucket("10r/s;burst=abc"), Err(ParseError::InvalidBurst(_))));
         assert!(matches!(parse_token_bucket("10r/s;max=5"), Err(ParseError::InvalidBurst(_))));
         assert!(matches!(parse_token_bucket("0r/s;burst=5"), Err(ParseError::ZeroLimit)));
+    }
+
+    #[test]
+    fn parse_rate_accepts_all_three_notations() {
+        assert_eq!(parse_rate("10r/s").unwrap(), RateLimit { limit: 10, window_secs: 1 });
+        assert_eq!(parse_rate("10/60s").unwrap(), RateLimit { limit: 10, window_secs: 60 });
+        assert_eq!(
+            parse_rate("10r/s;burst=20").unwrap(),
+            RateLimit { limit: 10, window_secs: 1 }
+        );
+        assert_eq!(parse_rate(""), Err(ParseError::Empty));
+    }
+
+    #[test]
+    fn equivalent_matches_same_rate_written_differently() {
+        // 10 requests/second written three different ways.
+        let a = RateLimit { limit: 10, window_secs: 1 };
+        let b = RateLimit { limit: 600, window_secs: 60 };
+        let c = RateLimit { limit: 36_000, window_secs: 3_600 };
+        assert!(equivalent(&a, &b));
+        assert!(equivalent(&b, &c));
+        assert!(equivalent(&a, &c));
+
+        let different = RateLimit { limit: 599, window_secs: 60 };
+        assert!(!equivalent(&a, &different));
+    }
+
+    #[test]
+    fn equivalent_handles_large_values_without_overflow() {
+        let huge = RateLimit { limit: u64::MAX, window_secs: u64::MAX };
+        assert!(equivalent(&huge, &huge));
+        assert!(!equivalent(&huge, &RateLimit { limit: u64::MAX, window_secs: 1 }));
     }
 
     #[test]

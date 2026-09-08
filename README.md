@@ -51,7 +51,18 @@ $ cargo run -- to-shorthand 10/13s
 
 $ cargo run -- gcra "10r/s;burst=20"
 emission_interval=0.1s delay_variation_tolerance=2s
+
+$ cargo run -- check 10r/s 36000/1h
+equivalent (10r/s)
+
+$ cargo run -- check 10r/s 500/60s
+not equivalent (10r/s vs 500r/m)
 ```
+
+`check` accepts any mix of shorthand, window, or token-bucket notation
+(burst is ignored) on either side, and exits non-zero when the two
+specs describe different steady-state rates, so it's usable as a
+condition in scripts.
 
 ## Design
 
@@ -65,7 +76,8 @@ beyond the standard library.
 ## Status
 
 Early skeleton. Handles shorthand, window, and token-bucket/GCRA
-notation; a `--check` mode for comparing two specs is next.
+notation, plus a `check` mode for comparing two specs. Fractional
+rates (`0.5r/s`) aren't supported yet.
 
 ## License
 
