@@ -12,7 +12,9 @@ ratewright converts between the two notations:
 - **shorthand** — nginx style, `<count>r/<unit>`, unit is `s`, `m`, `h`, or `d`.
   The unit can also carry a magnitude (`7r/2m`) — this isn't valid nginx
   config syntax, but it's how a window that isn't a whole multiple of a
-  single unit round-trips without rounding the count
+  single unit round-trips without rounding the count. The count can also
+  be a decimal (`0.5r/s`); the fractional part is folded into the window
+  instead of rounded away, so it parses to an exact `1/2s`
 - **window** — `<count>/<seconds>[unit]`, e.g. `10/60s` or `10/60`
 
 Both parse into the same internal `RateLimit { limit, window_secs }`,
@@ -49,6 +51,9 @@ $ cargo run -- to-shorthand 600/60s
 $ cargo run -- to-shorthand 10/13s
 10r/13s   # falls back to seconds since 13 isn't a clean minute/hour/day
 
+$ cargo run -- to-window 0.5r/s
+1/2s      # 0.5 requests/second is exactly 1 request every 2 seconds
+
 $ cargo run -- gcra "10r/s;burst=20"
 emission_interval=0.1s delay_variation_tolerance=2s
 
@@ -75,9 +80,9 @@ beyond the standard library.
 
 ## Status
 
-Early skeleton. Handles shorthand, window, and token-bucket/GCRA
-notation, plus a `check` mode for comparing two specs. Fractional
-rates (`0.5r/s`) aren't supported yet.
+Early skeleton. Handles shorthand (including fractional counts like
+`0.5r/s`), window, and token-bucket/GCRA notation, plus a `check` mode
+for comparing two specs.
 
 ## License
 

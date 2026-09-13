@@ -87,7 +87,11 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// Parses nginx-style shorthand, e.g. `"10r/s"` or `"600r/m"`.
+/// Parses nginx-style shorthand, e.g. `"10r/s"` or `"600r/m"`. The
+/// count may be a decimal, e.g. `"0.5r/s"` for one request every two
+/// seconds: the fractional part is folded into the window rather than
+/// rounded away, so `limit` always ends up a whole number of requests
+/// over some (possibly scaled-up) window.
 ///
 /// The unit may carry a leading magnitude, e.g. `"7r/2m"` for 7
 /// requests per 2 minutes. This isn't valid nginx config syntax (nginx
@@ -104,18 +108,54 @@ pub fn parse_shorthand(input: &str) -> Result<RateLimit, ParseError> {
         .strip_suffix('r')
         .or_else(|| count_part.strip_suffix('R'))
         .unwrap_or(count_part);
-    let limit: u64 = count_part
-        .parse()
-        .map_err(|_| ParseError::InvalidNumber(count_part.to_string()))?;
-    if limit == 0 {
+    let (numerator, denominator) = parse_decimal(count_part)?;
+    if numerator == 0 {
         return Err(ParseError::ZeroLimit);
     }
     let (magnitude, unit) = parse_magnitude_and_unit(unit_part)?;
-    let window_secs = magnitude * unit.seconds();
+    let window_secs = magnitude * unit.seconds() * denominator;
     if window_secs == 0 {
         return Err(ParseError::ZeroWindow);
     }
-    Ok(RateLimit { limit, window_secs })
+    Ok(RateLimit { limit: numerator, window_secs })
+}
+
+/// Splits a decimal string like `"10"` or `"0.5"` into a reduced
+/// `(numerator, denominator)` fraction, e.g. `"0.5"` becomes `(1, 2)`
+/// and `"1.5"` becomes `(3, 2)`. Whole numbers get a denominator of 1.
+fn parse_decimal(s: &str) -> Result<(u64, u64), ParseError> {
+    let invalid = || ParseError::InvalidNumber(s.to_string());
+    match s.split_once('.') {
+        None => {
+            let n: u64 = s.parse().map_err(|_| invalid())?;
+            Ok((n, 1))
+        }
+        Some((int_part, frac_part)) => {
+            if frac_part.is_empty() || !frac_part.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            let int_value: u64 = if int_part.is_empty() {
+                0
+            } else {
+                int_part.parse().map_err(|_| invalid())?
+            };
+            let frac_value: u64 = frac_part.parse().map_err(|_| invalid())?;
+            let denominator = 10u64.pow(frac_part.len() as u32);
+            let numerator = int_value * denominator + frac_value;
+            let divisor = gcd(numerator, denominator);
+            Ok((numerator / divisor, denominator / divisor))
+        }
+    }
+}
+
+/// Euclidean algorithm. `gcd(0, n) == n`, which keeps `parse_decimal`
+/// from dividing by zero when the numerator is `0` (e.g. `"0.0"`).
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
 }
 
 /// Renders a [`RateLimit`] as nginx-style shorthand, picking the
@@ -361,6 +401,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_fractional_shorthand() {
+        // 0.5 requests/second is exactly 1 request every 2 seconds.
+        assert_eq!(parse_shorthand("0.5r/s").unwrap(), RateLimit { limit: 1, window_secs: 2 });
+        // 1.5 requests/second is 3 requests every 2 seconds.
+        assert_eq!(parse_shorthand("1.5r/s").unwrap(), RateLimit { limit: 3, window_secs: 2 });
+        // The fractional part combines with an explicit unit magnitude.
+        assert_eq!(parse_shorthand("0.5r/2m").unwrap(), RateLimit { limit: 1, window_secs: 240 });
+        // A trailing zero fraction is just a whole number in disguise.
+        assert_eq!(parse_shorthand("2.0r/s").unwrap(), RateLimit { limit: 2, window_secs: 1 });
+    }
+
+    #[test]
+    fn rejects_malformed_fractional_shorthand() {
+        assert_eq!(parse_shorthand("0.0r/s"), Err(ParseError::ZeroLimit));
+        assert!(matches!(parse_shorthand(".r/s"), Err(ParseError::InvalidNumber(_))));
+        assert!(matches!(parse_shorthand("0.5.5r/s"), Err(ParseError::InvalidNumber(_))));
+        assert!(matches!(parse_shorthand("-0.5r/s"), Err(ParseError::InvalidNumber(_))));
+    }
+
+    #[test]
     fn parses_shorthand_with_a_magnitude_on_the_unit() {
         assert_eq!(
             parse_shorthand("7r/2m").unwrap(),
@@ -376,6 +436,7 @@ mod tests {
         assert_eq!(shorthand_to_window("7r/2m").unwrap(), "7/120s");
         assert_eq!(window_to_shorthand("7/120s").unwrap(), "7r/2m");
         assert_eq!(window_to_shorthand("10/13s").unwrap(), "10r/13s");
+        assert_eq!(shorthand_to_window("0.5r/s").unwrap(), "1/2s");
     }
 
     #[test]
