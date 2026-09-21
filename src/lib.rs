@@ -513,4 +513,123 @@ mod tests {
         assert!((gcra_emission_interval(&slow.rate) - 60.0).abs() < f64::EPSILON);
         assert!((gcra_delay_variation_tolerance(&slow) - 300.0).abs() < f64::EPSILON);
     }
+
+    // Property tests below. No proptest/quickcheck (zero dependencies),
+    // so this is a small hand-rolled PRNG driving the same kind of
+    // checks those crates would run: format/parse should round-trip
+    // losslessly across a wide spread of inputs, and the parsers should
+    // never panic no matter what they're fed.
+
+    /// splitmix64, chosen for being small enough to embed here and
+    /// having no funny business with low-bit correlation like a naive
+    /// LCG would.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+
+        /// Uniform-ish over `[low, high]`. The `% ` bias toward the low
+        /// end is irrelevant here since these tests only care about
+        /// exercising a wide spread of values, not a perfect distribution.
+        fn range(&mut self, low: u64, high: u64) -> u64 {
+            low + self.next_u64() % (high - low + 1)
+        }
+    }
+
+    #[test]
+    fn shorthand_round_trips_for_many_random_rates() {
+        let mut rng = Rng(0x5EED_5EED_5EED_5EED);
+        for _ in 0..2_000 {
+            let rate = RateLimit {
+                limit: rng.range(1, 1_000_000),
+                window_secs: rng.range(1, 1_000_000),
+            };
+            let text = format_shorthand(&rate);
+            assert_eq!(parse_shorthand(&text).unwrap(), rate, "round trip failed for {text}");
+        }
+    }
+
+    #[test]
+    fn window_round_trips_for_many_random_rates() {
+        let mut rng = Rng(0xC0FFEE_C0FFEE_C0FF);
+        for _ in 0..2_000 {
+            let rate = RateLimit {
+                limit: rng.range(1, 1_000_000),
+                window_secs: rng.range(1, 1_000_000),
+            };
+            let text = format_window(&rate);
+            assert_eq!(parse_window(&text).unwrap(), rate, "round trip failed for {text}");
+        }
+    }
+
+    #[test]
+    fn convenience_wrappers_agree_with_direct_format_calls() {
+        let mut rng = Rng(0xABCD_1234_ABCD_1234);
+        for _ in 0..1_000 {
+            let rate = RateLimit {
+                limit: rng.range(1, 500_000),
+                window_secs: rng.range(1, 500_000),
+            };
+            assert_eq!(shorthand_to_window(&format_shorthand(&rate)).unwrap(), format_window(&rate));
+            assert_eq!(window_to_shorthand(&format_window(&rate)).unwrap(), format_shorthand(&rate));
+        }
+    }
+
+    #[test]
+    fn token_bucket_round_trips_for_many_random_rates() {
+        let mut rng = Rng(0x1234_5678_9ABC_DEF0);
+        for _ in 0..2_000 {
+            let bucket = TokenBucket {
+                rate: RateLimit {
+                    limit: rng.range(1, 1_000_000),
+                    window_secs: rng.range(1, 1_000_000),
+                },
+                burst: rng.range(0, 1_000_000),
+            };
+            let text = format_token_bucket(&bucket);
+            assert_eq!(parse_token_bucket(&text).unwrap(), bucket, "round trip failed for {text}");
+        }
+    }
+
+    #[test]
+    fn equivalent_is_reflexive_for_random_rates() {
+        let mut rng = Rng(0x0BAD_F00D_0BAD_F00D);
+        for _ in 0..2_000 {
+            let rate = RateLimit {
+                limit: rng.range(1, u32::MAX as u64),
+                window_secs: rng.range(1, u32::MAX as u64),
+            };
+            assert!(equivalent(&rate, &rate));
+        }
+    }
+
+    #[test]
+    fn parsers_never_panic_on_random_garbage() {
+        // Small alphabet, short strings, digits capped at '0'-'3': wide
+        // enough to hit every branch in the parsers (separators, units,
+        // fractions, burst syntax, case folding) without ever building a
+        // digit run long enough to overflow a u64 internally, which
+        // would be a real bug but a different one than what this test
+        // is chasing.
+        const ALPHABET: &[u8] = b"0123r/.;=smhdRburst -";
+        let mut rng = Rng(0xFEED_FACE_1234_5678);
+        for _ in 0..5_000 {
+            let len = rng.range(0, 10) as usize;
+            let mut s = String::with_capacity(len);
+            for _ in 0..len {
+                let idx = rng.range(0, ALPHABET.len() as u64 - 1) as usize;
+                s.push(ALPHABET[idx] as char);
+            }
+            let _ = parse_shorthand(&s);
+            let _ = parse_window(&s);
+            let _ = parse_token_bucket(&s);
+            let _ = parse_rate(&s);
+        }
+    }
 }
